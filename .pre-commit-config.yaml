@@ -1,0 +1,33 @@
+# Runs on every `git commit`. Install once with: pre-commit install
+# Run manually across the repo with: pre-commit run --all-files
+#
+# Hook order matters: ruff --fix first (it may rewrite imports), then black
+# last so formatting always has the final say.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1000] # model weights must never be committed
+      - id: detect-private-key # backstop for Hard Rule #1
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      # Linting only — ruff-format is deliberately NOT enabled here, because
+      # black below is our formatter and two formatters would fight.
+      - id: ruff
+        args: [--fix]
+        files: ^backend/
+
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        files: ^backend/
