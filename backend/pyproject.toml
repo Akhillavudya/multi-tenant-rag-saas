@@ -36,6 +36,22 @@ dependencies = [
     "pypdf>=5.1.0",       # PDF text extraction, pure Python
     "python-docx>=1.1.2", # .docx
 
+    # --- Async ingestion (Phase 2) ---
+    # The [redis] extra brings the redis client Celery uses as its broker.
+    # Redis is already in docker-compose for this purpose.
+    "celery[redis]>=5.4.0",
+
+    # Multipart form parsing. Required by Starlette for `UploadFile` — without
+    # it the documents router fails at import, not at request time.
+    "python-multipart>=0.0.20",
+
+    # --- Auth (Phase 2) ---
+    # Clerk signs session tokens with RS256 and publishes the public keys as a
+    # JWKS document, so we only ever verify — no shared secret lives here. The
+    # [crypto] extra pulls `cryptography`, which provides the RSA verification
+    # PyJWT itself does not implement.
+    "pyjwt[crypto]>=2.9.0",
+
     # --- HTTP (Phase 1) ---
     # Async client for Ollama; also what FastAPI's TestClient uses under the
     # hood, so it is a runtime dep rather than dev-only.

@@ -6,6 +6,7 @@ set of knobs this app has is exactly the set of fields below — and a typo in
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -49,6 +50,24 @@ class Settings(BaseSettings):
     clerk_secret_key: str | None = None
     clerk_publishable_key: str | None = None
     clerk_jwks_url: str | None = None
+    # The `iss` claim we require on every session token. Verifying it is what
+    # stops a validly-signed token from a DIFFERENT Clerk instance (anyone can
+    # create one for free) being accepted here — the signature would check out
+    # against that instance's JWKS, so the issuer is the real tenant boundary.
+    clerk_issuer: str | None = None
+    # How long a fetched JWKS document is trusted before refetching. Clerk
+    # rotates signing keys; an unknown `kid` forces an immediate refetch anyway,
+    # so this only bounds how long a REVOKED key stays accepted.
+    clerk_jwks_cache_seconds: int = 3600
+
+    # --- Uploads (Phase 2) ---
+    # Local disk in dev; Phase 7 swaps this for object storage on the Oracle
+    # box. Kept as a setting rather than a constant so the worker and the API,
+    # which are separate processes, can be pointed at the same shared path.
+    upload_dir: Path = Path(".data/uploads")
+    # Rejected before the bytes are written, not after. 25MB is roughly a
+    # 500-page PDF; the ceiling exists so one upload cannot fill the disk.
+    max_upload_bytes: int = 25 * 1024 * 1024
 
     # --- Billing (Phase 6) ---
     stripe_secret_key: str | None = None

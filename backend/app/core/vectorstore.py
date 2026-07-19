@@ -171,6 +171,7 @@ class VectorStore:
         collection: str | None = None,
         url: str | None = None,
         api_key: str | None = None,
+        location: str | None = None,
     ) -> None:
         """`dimension` is required and has no default on purpose.
 
@@ -179,12 +180,27 @@ class VectorStore:
         a silent corruption: vectors of the wrong width are rejected at write
         time, but only after a collection has been created that can never
         accept them.
+
+        `location` selects Qdrant's LOCAL mode — pass ":memory:" to get a real
+        Qdrant implementation running inside this process, with no server. It
+        exists for `tests/test_isolation.py`: that test runs in CI on every push
+        (PLAN §7), and a test guarding a security boundary must not be the one
+        that gets skipped because a container failed to start. Local mode is not
+        a mock — the payload filtering under test is the production code path —
+        but it is single-process and unindexed, so it is for tests only. When
+        `location` is set, `url` and `api_key` are ignored: a client cannot be
+        both embedded and remote, and silently preferring one would make a
+        misconfigured test appear to pass against an empty local store.
         """
         self._dimension = dimension
         self._collection = collection or settings.qdrant_collection
-        self._client = AsyncQdrantClient(
-            url=url or settings.qdrant_url,
-            api_key=api_key or settings.qdrant_api_key,
+        self._client = (
+            AsyncQdrantClient(location=location)
+            if location is not None
+            else AsyncQdrantClient(
+                url=url or settings.qdrant_url,
+                api_key=api_key or settings.qdrant_api_key,
+            )
         )
 
     @property
@@ -357,6 +373,32 @@ class VectorStore:
         except Exception as exc:
             raise VectorStoreUnavailableError(
                 f"delete of document {document_id!r} failed: {exc}"
+            ) from exc
+
+    async def delete_chatbot(self, *, org_id: str, chatbot_id: str) -> None:
+        """Remove every chunk belonging to one chatbot.
+
+        Called when a bot is deleted. The SQL rows are already gone by then, so
+        this is reclaiming storage rather than closing a leak — nothing can
+        search these points, because every search filters on an org/bot pair
+        that no longer resolves to a row.
+
+        Still scoped by org as well as bot, for the same reason
+        `delete_document` is: a delete built from one identifier is one guessed
+        id away from being someone else's data.
+        """
+        _require_scope(org_id, chatbot_id)
+        try:
+            await self._client.delete(
+                collection_name=self._collection,
+                points_selector=models.FilterSelector(
+                    filter=self._scope_filter(org_id=org_id, chatbot_id=chatbot_id)
+                ),
+                wait=True,
+            )
+        except Exception as exc:
+            raise VectorStoreUnavailableError(
+                f"delete of chatbot {chatbot_id!r} failed: {exc}"
             ) from exc
 
     # -- reads --------------------------------------------------------------

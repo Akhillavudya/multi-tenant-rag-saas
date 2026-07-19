@@ -9,6 +9,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.chatbots import router as chatbots_router
+from app.api.documents import router as documents_router
 from app.api.health import router as health_router
 from app.config import settings
 from app.core.logging import configure_logging
@@ -39,4 +41,9 @@ app = FastAPI(
 
 app.add_middleware(RequestContextMiddleware)
 
+# /health stays unauthenticated — load balancers and uptime checks have no
+# session token. Everything below it carries a router-level auth dependency;
+# see app/security/clerk.py on why that is a dependency rather than middleware.
 app.include_router(health_router)
+app.include_router(chatbots_router)
+app.include_router(documents_router)

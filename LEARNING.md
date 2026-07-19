@@ -102,9 +102,9 @@ vocabularies · [x] HNSW / vector indexes ·
 why rerank wins) · [x] Grounded prompting & hallucination control ·
 [x] Protocols/interfaces (structural typing) · [x] the factory pattern ·
 [x] async/await in Python
-**Phase 2** — [ ] Multi-tenancy & payload-filter isolation · [ ] JWT & Clerk
-auth (what's inside a JWT, signature verification) · [ ] Celery task queues
-(broker, worker, ack, retry) · [ ] SQLAlchemy ORM & sessions
+**Phase 2** — [x] Multi-tenancy & payload-filter isolation · [x] JWT & Clerk
+auth (what's inside a JWT, signature verification) · [x] Celery task queues
+(broker, worker, ack, retry) · [x] SQLAlchemy ORM & sessions
 **Phase 3** — [ ] SSE streaming (vs WebSockets vs polling) · [ ] Rate limiting
 & metering (token bucket) · [ ] Idempotency
 **Phase 4** — [ ] React/Next.js mental model (server vs client components) ·
@@ -1012,3 +1012,262 @@ string must be exact to be usable · every byte of the template is billed on eve
 request · measure refusal, not just accuracy.
 
 ---
+
+---
+
+### Multi-tenancy & payload-filter isolation            [Phase 2]
+**What it is** — One shared database/collection serving many customers, where
+every row and every vector carries a tenant id and every query filters on it.
+Isolation is enforced by application logic, not by physical separation.
+**Problem it solves** — We cannot give each customer their own Qdrant
+collection and Postgres database: per-collection overhead (an HNSW graph,
+segment files) would be paid thousands of times, and creating one per signup
+turns onboarding into a schema migration. Shared storage is the only affordable
+shape — and it makes a missing `WHERE` clause a data breach.
+**Intuition** — A storage warehouse where every customer's boxes sit on the same
+shelves, separated only by labels. Cheap and dense; the labels had better be
+checked every single time.
+**How it works** — 1) Every Qdrant point carries `{org_id, chatbot_id}` in its
+payload, with keyword indexes on both. 2) Every search builds a `must` filter
+(AND) from both values. 3) Both are **required keyword-only arguments** on
+`VectorStore.search`, so an unfiltered call cannot be written. 4) Tenant ids
+come from a verified JWT, never from a request body. 5) SQL mirrors this:
+`documents.org_id` is denormalised so every query filters a column physically
+on the row, with no join to forget.
+**Complexity** — A filtered HNSW search stays ~O(log N) *provided* the filter
+field has a payload index. Without one, Qdrant post-filters the graph walk's
+candidates, and recall collapses as tenant count rises — the classic
+multi-tenant vector bug.
+**Why this / why not alternatives** — vs **collection-per-tenant**: real
+physical isolation, but thousands of HNSW graphs and schema ops at signup;
+correct at very high per-tenant volume or under a regulatory requirement. vs
+**database-per-tenant** (Postgres): same trade, plus migrations must run N
+times. vs **row-level security (RLS)** in Postgres: genuinely good — the
+database enforces it, so a forgotten `WHERE` still fails safe — but it has no
+equivalent on the Qdrant side, so we would end up with two different isolation
+models. We chose one model applied consistently, enforced by type signatures
+and a mutation-tested suite. RLS is worth revisiting as defence in depth.
+**Internal working** — Qdrant's filtered search walks the HNSW graph and checks
+the payload condition against the indexed field; a keyword index is a
+posting-list lookup, so the check is cheap enough to run at every hop.
+**Common bugs** —
+- *Empty tenant id.* `org_id=""` does not bypass the filter — it matches points
+  whose org_id is literally `""`, i.e. none. The caller sees an empty list and
+  reads it as "no documents". Debug: assert the scope is non-empty and raise,
+  never search. (`_require_scope`.)
+- *Filtering on org only, not bot.* Never shows up as a cross-customer leak in
+  testing — only as one customer's sales bot quoting their HR handbook.
+- *Adding a second search function* (a debug endpoint, an admin count) that
+  forgets the filter. Its own tests pass; nothing else notices. Debug: the
+  source-scanning structural test in `test_isolation.py`.
+- *Missing payload index.* Correct results, quietly degrading recall as tenants
+  grow. Debug: check `create_payload_index` ran; local-mode Qdrant warns that
+  indexes are inert.
+**Interview questions** —
+1. One collection with filters vs one per tenant — argue both sides.
+2. Why is `org_id` a required keyword-only argument rather than optional?
+3. How would you *prove* isolation holds? (Mutation-test the filter.)
+4. Where must the tenant id come from, and why never the request body?
+5. Why is `documents.org_id` denormalised when a join could reach it?
+6. Why 404 rather than 403 for another tenant's resource?
+7. What breaks if the payload field has no index?
+**Mini exercise** — By hand, delete one condition from `_scope_filter` and
+predict which of the 17 isolation tests fail, then run them and compare. (Answer
+from the real run: 9.)
+**5 takeaways** — (1) Shared storage makes isolation a code property, so encode
+it in type signatures. (2) `must` = AND is what makes a forged bot id return the
+empty intersection. (3) An empty scope must raise, never search. (4) Index every
+field you filter on. (5) A sacred test you have never seen fail is unverified.
+
+---
+
+### JWT & Clerk auth (signature verification)            [Phase 2]
+**What it is** — A JSON Web Token is a base64url-encoded header + payload plus a
+signature: `header.payload.signature`. Anyone can read it; only the holder of
+the private key could have produced the signature. Clerk signs session tokens
+with RS256; we only ever verify, using public keys it publishes as a JWKS.
+**Problem it solves** — The backend must know which org a request belongs to
+without trusting the request. A signed token is a claim we can check
+cryptographically, so `org_id` becomes a fact rather than user input — which is
+the foundation everything in the isolation entry rests on.
+**Intuition** — A tamper-evident wristband. You can read the name on it; you
+cannot alter it without the hologram no longer matching.
+**How it works** — 1) Split on dots. 2) Decode the header for `alg` and `kid`
+(key id). 3) Fetch the matching public key from the issuer's JWKS URL. 4) Verify
+the signature over `header.payload` **using an algorithm we chose**. 5) Validate
+claims: `exp`, `nbf`/`iat` with small leeway, `iss`. 6) Only now read the
+payload as fact — here, map Clerk's `org_id` onto our own `Organization` row.
+**Math (light)** — RS256 = RSA signature over a SHA-256 digest. Signing uses the
+private key, verifying the public one. This asymmetry is the point: Clerk can
+mint tokens, we can only check them, so a breach of our server yields no ability
+to forge.
+**Why this / why not alternatives** — vs **HS256** (shared secret): symmetric,
+so anyone who can verify can also forge; fine inside one service, wrong across
+an issuer boundary. vs **opaque session tokens + a lookup**: instantly
+revocable, but a database (or Clerk API) round trip on every request. JWTs trade
+revocation for statelessness, which is why they are short-lived (~60s) — the
+expiry *is* the revocation mechanism. vs **rolling our own auth**: password
+storage, reset flows, MFA, breach handling. Not a good use of a solo build.
+**Internal working** — JWKS is a JSON document of public keys, each with a
+`kid`. Rotation works by publishing the new key alongside the old and signing
+new tokens with the new `kid`; verifiers that see an unknown `kid` refetch. Our
+`_JWKSCache` caches the client (so we do not fetch per request) with a TTL —
+because an unknown kid triggers a refetch, but a *revoked* kid stays known, and
+without a ceiling would be accepted for the whole process lifetime.
+**Common bugs** —
+- *Algorithm confusion.* Attacker sets `alg: none`, or switches to `HS256` and
+  signs with the RSA **public** key (which is public). A library that reads
+  `alg` from the token verifies both. Fix: pass `algorithms=["RS256"]`
+  explicitly. This is the single most important line in `security/clerk.py`.
+- *Not verifying `iss`.* Anyone can create a free Clerk instance; its tokens are
+  validly signed against *its* JWKS. Without an issuer check, only the accident
+  of a different JWKS URL stops them.
+- *Clock skew.* A server two seconds fast rejects fresh tokens as "not yet
+  valid" — intermittent and maddening. Fix: small `leeway`.
+- *Leaky error messages.* "expired" vs "bad signature" tells an attacker which
+  part of the forgery to fix. Fix: one uniform message out, detail to the log.
+- *401 vs 403.* Returning 401 for "authenticated but not authorized" sends
+  clients into an infinite token-refresh loop.
+**Interview questions** —
+1. Walk through verifying a JWT end to end.
+2. What is the `alg: none` attack, and how do you defend?
+3. Why is HS256 wrong across a trust boundary?
+4. How do you revoke a JWT? (You mostly don't — you keep them short.)
+5. How does key rotation work without downtime?
+6. Why look the org up in *our* DB instead of trusting the token's org id?
+7. When 401, when 403, when 500?
+**Mini exercise** — Take a real token, base64url-decode the header and payload
+by hand, and name every claim. Then flip one character in the payload and
+confirm verification fails.
+**5 takeaways** — (1) Never let a token choose its own verification algorithm.
+(2) Verify `iss`, not just the signature. (3) Short expiry is the revocation
+story. (4) A signed claim still has to map to a row you own. (5) Uniform errors
+out, detailed errors to logs.
+
+---
+
+### Celery task queues (broker, worker, ack, retry)            [Phase 2]
+**What it is** — A distributed task queue. The API publishes a message (task
+name + arguments) to a broker (Redis here); a separate worker process pops it
+and runs the function. Work happens outside the request/response cycle.
+**Problem it solves** — Ingesting a 500-page PDF — parse, chunk, embed a
+thousand chunks — takes minutes. In-request that holds an HTTP connection open
+for the duration, ties up a server thread, and loses everything if the client
+disconnects. The upload endpoint's real job is to durably record "this needs
+work" and return; `DocumentStatus.PENDING` is exactly that record.
+**Intuition** — A restaurant's kitchen ticket rail. The waiter takes your order
+and leaves in seconds; cooking runs on its own clock, and the ticket survives
+the waiter going on break.
+**How it works** — 1) API calls `task.delay(document_id=...)`, which serializes
+a message to Redis. 2) A worker pops it, deserializes, and calls the function.
+3) The worker re-reads current state from Postgres. 4) On success it writes a
+terminal status; on transient failure it re-raises via `self.retry`, which
+re-publishes with a countdown. 5) It acknowledges the message — **after**
+completion, because `acks_late=True`.
+**Why this / why not alternatives** — vs **FastAPI `BackgroundTasks`**: runs
+in the API process, so a restart loses the work and CPU-heavy embedding competes
+with request handling. Fine for sending an email, not for this. vs **a database
+job table + polling**: no extra broker and transactionally consistent with the
+data, but you rebuild retries, backoff, visibility timeouts and scheduling
+yourself. vs **RQ**: simpler, fewer footguns, but no `acks_late`, weaker
+scheduling, smaller ecosystem. vs **Redis vs RabbitMQ as broker**: Redis is
+already in our compose file and adequate; RabbitMQ has stronger delivery
+guarantees and would be the upgrade if lost tasks ever became a real problem.
+**Internal working** — The broker is a list/stream in Redis. A worker pool of
+processes blocks on a pop. `acks_late` means the message stays reserved until
+the task finishes, so a worker that dies mid-task lets the message become
+visible again and another worker picks it up. `prefetch_multiplier` controls how
+many messages one worker reserves in advance.
+**Common bugs** —
+- *"Received unregistered task".* Reads like a broker problem; it means the
+  module isn't in `include=[...]`, so the worker never imported the task.
+- *Passing objects instead of ids.* A message is a snapshot — the row may be
+  stale by execution time. It also puts data in Redis, logs, and monitoring, and
+  bloats the queue. Send an id; re-read the truth.
+- *Pickle serializer.* Deserialization executes arbitrary code, so a writable
+  broker becomes RCE on the worker. Use JSON.
+- *Enqueueing before committing.* The worker can start before the transaction is
+  visible and fail to find the row. Commit first, publish second.
+- *Retrying non-transient failures.* A scanned PDF fails identically forever;
+  retrying delays the honest error and burns queue capacity. Classify first.
+- *Thundering herd.* Fifty documents failing on one outage all retry at the same
+  instant and re-break the recovering service. Fix: jitter the backoff.
+- *Leaking DB sessions.* The worker is long-lived; one unclosed session per task
+  exhausts the pool hours later, under load, looking like a database fault.
+- *Windows.* The default prefork pool needs `fork()`. Use `--pool=solo` locally.
+**Interview questions** —
+1. Why not just run this in the request?
+2. What does `acks_late` buy, and what does it demand? (Idempotency.)
+3. How do you make a task idempotent? (Deterministic ids — ours overwrite.)
+4. Which failures should retry and which should not?
+5. Why exponential backoff, and why jitter?
+6. Why send ids rather than objects?
+7. Why is pickle a security problem here?
+8. A document is stuck in PROCESSING. Walk through diagnosing it.
+**Mini exercise** — Trace, on paper, what happens to a document row when the
+worker is killed `SIGKILL` mid-embedding — with `acks_late` on, and with it off.
+**5 takeaways** — (1) Queues trade latency for durability and isolation.
+(2) Late ack + idempotency is the safe pairing. (3) Classify failures before
+retrying. (4) Jitter or stampede. (5) Every exit path must write a terminal
+status, or the UI spins forever.
+
+---
+
+### SQLAlchemy ORM, sessions & declarative models            [Phase 2]
+**What it is** — An Object-Relational Mapper: Python classes map to tables,
+instances to rows. The `Session` is a unit of work — it tracks loaded objects,
+batches changes, and flushes them as SQL inside a transaction.
+**Problem it solves** — Hand-written SQL strings for every query is repetitive
+and injection-prone; the ORM gives typed models, composable queries, and one
+place (`db/tables.py`) where the schema is described — which Alembic then diffs
+to generate migrations.
+**Intuition** — A translator that also keeps minutes: it converts between
+Python objects and rows, and remembers everything you changed so it can write it
+all down at once when you commit.
+**How it works** — 1) Models subclass `Base`; `mapped_column` describes each
+column. 2) `SessionLocal()` opens a unit of work bound to a connection. 3)
+Queries are built with `select()` and executed via `session.scalars()`. 4)
+Changing a loaded object marks it dirty. 5) `commit()` flushes pending SQL and
+commits the transaction. 6) `close()` returns the connection to the pool.
+**Why this / why not alternatives** — vs **raw SQL / psycopg**: full control and
+no abstraction cost, but no model registry for Alembic to diff and far more
+boilerplate. vs **Django ORM**: excellent, but it comes with Django. vs
+**SQLModel**: SQLAlchemy plus Pydantic in one class — attractive, and rejected
+because fusing the storage model and the API model is exactly what we did *not*
+want (see `api/schemas.py`: request models must be a smaller, different shape).
+vs **async SQLAlchemy**: viable, but our handlers are sync `def` in a threadpool,
+so the sync API is the honest match and avoids colouring every call site.
+**Internal working** — The Session holds an identity map (one Python object per
+primary key per session) and a list of pending changes. `autoflush=False` here,
+so nothing is written until we say so. `expire_on_commit=False`, so objects stay
+readable after `commit()` — without it, touching any attribute post-commit
+triggers a fresh SELECT, and in a request handler that often raises
+`DetachedInstanceError`.
+**Common bugs** —
+- *Leaked sessions.* Not closing in a long-lived worker exhausts the pool. Use
+  `try/finally`, or the `get_db` dependency in the API.
+- *`DetachedInstanceError`.* Reading an attribute after the session closed.
+  Cause: `expire_on_commit=True` (the default) plus a lazy-loaded relationship.
+- *N+1 queries.* Looping over parents and touching a lazy relationship issues
+  one query per row. Fix: `selectinload`/`joinedload`.
+- *Fetch-then-check authorization.* Loading a row and *then* verifying ownership
+  is a tenancy bug waiting to happen; put the scope in the `WHERE`.
+- *`sqlalchemy.Enum` vs `enum.Enum`.* Same word, unrelated things — one is a
+  column type. Alias one of them.
+- *Model not imported.* Alembic autogenerate only sees imported models, so a
+  model missing from the registry gets a `DROP TABLE` generated for it.
+**Interview questions** —
+1. What is the Session's unit-of-work pattern?
+2. What does `expire_on_commit=False` change, and why do we set it?
+3. What is an N+1 query and how do you find one?
+4. Why does Alembic need a model registry module?
+5. Why keep Pydantic schemas separate from ORM models?
+6. Why is `pool_pre_ping` needed against serverless Postgres (Neon)?
+7. Where should a tenant scope live — the query or the handler? Why?
+**Mini exercise** — Set `echo=True` on the engine, run a list-documents query,
+and read the emitted SQL. Then add a relationship access in a loop and count how
+many statements appear.
+**5 takeaways** — (1) The Session is a transaction plus a change log.
+(2) Always close it; `finally` or a dependency. (3) Keep API schemas separate
+from tables. (4) Scope in the `WHERE`, never after the fetch. (5) A model
+Alembic cannot see is a model Alembic will drop.
