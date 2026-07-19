@@ -148,6 +148,29 @@ class EmbeddingProvider(Protocol):
         """
         ...
 
+    def count_tokens(self, text: str) -> int:
+        """Length of `text` in THIS model's tokens.
+
+        Belongs on the embedder because the answer is a property of the model,
+        not of the text: bge-small and text-embedding-3 tokenize the same string
+        into different counts, so a generic tokenizer would be confidently wrong
+        the moment EMBEDDING_PROVIDER changes. The chunker consumes this to size
+        chunks against the real `dimension`-bearing model's context window,
+        rather than guessing from character count.
+
+        Getting it wrong is silent. Text past the model's window is truncated
+        during encoding with no error — you embed a chunk, store the vector, and
+        the tail of the text simply is not in it.
+
+        SYNC, unlike every other method on this Protocol. That asymmetry is the
+        point: `async` here marks I/O, not expense. Tokenization is microseconds
+        of pure CPU with no network and no model forward pass, and the chunker
+        calls it thousands of times inside a tight recursive loop — making it a
+        coroutine would force awaits through that entire call path and buy
+        nothing, since there is no I/O to overlap with.
+        """
+        ...
+
 
 @runtime_checkable
 class RerankProvider(Protocol):
