@@ -39,6 +39,7 @@ from app.providers.base import (
     EmbeddingProvider,
     LLMProvider,
     ProviderAuthError,
+    ProviderError,
     ProviderInvalidRequestError,
     RerankProvider,
 )
@@ -222,6 +223,59 @@ def get_llm(name: str | None = None) -> LLMProvider:
     return _llm(name or settings.llm_provider)
 
 
+@cache
+def _llm_with_fallback(primary_name: str, secondary_name: str | None) -> LLMProvider:
+    """Build the primary, optionally wrapped in failover. Cached like the rest.
+
+    Degrades to the bare primary in three cases, each of which is a
+    configuration statement rather than an error:
+
+    - no fallback configured (`LLM_FALLBACK_PROVIDER=` empty),
+    - fallback equals primary, which would retry the outage we are escaping,
+    - the fallback cannot be built — almost always a missing API key.
+
+    That last one is the interesting choice. Refusing to start because the
+    *backup* has no key would take down a service whose primary works perfectly;
+    logging loudly and running unprotected is the lesser harm. The log line is
+    the thing that stops "unprotected" from becoming permanent.
+    """
+    primary = _llm(primary_name)
+    if not secondary_name or secondary_name == primary_name:
+        return primary
+
+    try:
+        secondary = _llm(secondary_name)
+    except ProviderError as exc:
+        logger.warning(
+            "fallback LLM provider unavailable; running without failover",
+            extra={
+                "primary": primary_name,
+                "fallback": secondary_name,
+                "error": str(exc),
+            },
+        )
+        return primary
+
+    from app.providers.llm.fallback import FallbackLLM
+
+    logger.info(
+        "LLM failover enabled",
+        extra={"primary": primary_name, "fallback": secondary_name},
+    )
+    return FallbackLLM(primary, secondary)
+
+
+def get_llm_with_fallback() -> LLMProvider:
+    """The LLM used to answer a chat request: configured provider plus failover.
+
+    Separate from `get_llm()` because failover is not always wanted. Ingestion
+    does not use an LLM at all, and the CLI deliberately exercises exactly the
+    provider named in the env so that "swapping providers is one env var" stays
+    a claim you can verify rather than one a fallback could quietly mask.
+    """
+    return _llm_with_fallback(settings.llm_provider, settings.llm_fallback_provider)
+
+
 def get_embedder(name: str | None = None) -> EmbeddingProvider:
     """Return the configured embedder, or a specific one by name.
 
@@ -263,5 +317,6 @@ def reset_provider_cache() -> None:
     hundred MB it no longer needs.
     """
     _llm.cache_clear()
+    _llm_with_fallback.cache_clear()
     _embedder.cache_clear()
     _reranker.cache_clear()

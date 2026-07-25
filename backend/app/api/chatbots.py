@@ -36,6 +36,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.schemas import ChatbotCreate, ChatbotOut, ChatbotUpdate, UsageOut
+from app.core.metering import message_usage
 from app.db.base import get_db
 from app.db.tables import Chatbot, ChatbotStatus, Document, Organization
 from app.providers.factory import get_embedder
@@ -83,7 +84,14 @@ def owned_chatbot(db: Session, principal: Principal, chatbot_id: uuid.UUID) -> C
 
 
 def _usage(db: Session, organization: Organization) -> UsageOut:
-    """Current counts against this org's plan caps."""
+    """Current counts against this org's plan caps.
+
+    Chatbots and documents are counted from their tables because they are
+    stocks — deleting one frees a slot, so a stored counter would drift the
+    first time a customer tidied up. Messages come from `usage_records` because
+    they are a monthly flow that must not be recomputed by scanning every
+    message a tenant has ever sent.
+    """
     limits = organization.limits
     chatbots_used = (
         db.scalar(
@@ -97,12 +105,16 @@ def _usage(db: Session, organization: Organization) -> UsageOut:
         )
         or 0
     )
+    messages = message_usage(db, organization)
     return UsageOut(
         plan=organization.plan,
         chatbots_used=chatbots_used,
         chatbots_limit=limits["chatbots"],
         documents_used=documents_used,
         documents_limit=limits["documents"],
+        period=messages.period,
+        messages_used=messages.messages_used,
+        messages_limit=messages.messages_limit,
     )
 
 

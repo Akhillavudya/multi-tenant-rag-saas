@@ -67,12 +67,25 @@ def load_prompt(name: str = GROUNDED_ANSWER) -> str:
     return text
 
 
-def render_grounded_answer(context: str) -> str:
+def render_grounded_answer(context: str, persona: str | None = None) -> str:
     """Build the system prompt for one grounded answer.
 
     Takes the already-formatted context block (see `generation.build_context`),
     not the raw chunks: deciding how a chunk is labelled and cited is generation's
     job, and this module only fills a slot.
+
+    `persona` is the chatbot's own `system_prompt` — the owner's description of
+    the bot's voice and scope. It is inserted into a STYLE block ABOVE the rules,
+    never appended below them, and the template's rule 11 states explicitly that
+    style cannot relax grounding. Order is the cheap half of that defence:
+    instructions nearer the end of a system prompt carry more weight, so the
+    rules that must win are the ones that finish.
+
+    That is mitigation, not a guarantee. A determined bot owner can still write a
+    persona that degrades answer quality — which is acceptable, because it is
+    THEIR bot and their documents. The threat this guards against is a persona
+    that silently turns off citation or grounding and leaves the product looking
+    like it hallucinates.
 
     `Template.substitute`, not `str.format`: prompt text accumulates literal
     braces over time — JSON examples, output formats, code snippets — and
@@ -86,8 +99,17 @@ def render_grounded_answer(context: str) -> str:
         # answer and hides the real bug upstream in retrieval.
         raise PromptError("cannot render a grounded prompt with empty context")
 
+    # The whole block is built here rather than in the template so that a bot
+    # with no custom prompt gets no empty heading — a dangling "STYLE" with
+    # nothing under it is the kind of prompt debris models react to oddly.
+    persona_block = (
+        f"STYLE\n\n{persona.strip()}\n" if persona and persona.strip() else ""
+    )
+
     try:
-        return Template(load_prompt(GROUNDED_ANSWER)).substitute(context=context)
+        return Template(load_prompt(GROUNDED_ANSWER)).substitute(
+            context=context, persona=persona_block
+        )
     except KeyError as exc:
         # A placeholder in the file that this function does not supply.
         raise PromptError(

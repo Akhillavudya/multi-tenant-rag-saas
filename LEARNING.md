@@ -105,8 +105,8 @@ why rerank wins) · [x] Grounded prompting & hallucination control ·
 **Phase 2** — [x] Multi-tenancy & payload-filter isolation · [x] JWT & Clerk
 auth (what's inside a JWT, signature verification) · [x] Celery task queues
 (broker, worker, ack, retry) · [x] SQLAlchemy ORM & sessions
-**Phase 3** — [ ] SSE streaming (vs WebSockets vs polling) · [ ] Rate limiting
-& metering (token bucket) · [ ] Idempotency
+**Phase 3** — [x] SSE streaming (vs WebSockets vs polling) · [x] Rate limiting
+& metering (token bucket) · [x] Idempotency
 **Phase 4** — [ ] React/Next.js mental model (server vs client components) ·
 [ ] Tailwind basics
 **Phase 5** — [ ] iframes, postMessage & CORS (why the widget is sandboxed)
@@ -1271,3 +1271,243 @@ many statements appear.
 (2) Always close it; `finally` or a dependency. (3) Keep API schemas separate
 from tables. (4) Scope in the `WHERE`, never after the fetch. (5) A model
 Alembic cannot see is a model Alembic will drop.
+
+---
+
+### Server-Sent Events (SSE) & streaming responses            [Phase 3]
+**What it is** — A one-way channel from server to browser over ordinary HTTP.
+The server holds the response open and writes text frames; the browser's
+`EventSource` fires an event per frame. One frame is `event: <name>`, one or
+more `data: <line>`, then a **blank line** that terminates it.
+**Problem it solves** — An LLM takes 3–8 seconds to finish an answer. Waiting for
+all of it and returning one JSON body makes the product feel broken, even though
+total latency is identical. Streaming shows the first token in ~400ms, which is
+the number users actually perceive.
+**Intuition** — A ticker tape rather than a letter. The message arrives as it is
+written; you start reading before the writer has finished.
+**How it works** — 1) Handler returns a `StreamingResponse` wrapping an async
+generator with `media_type="text/event-stream"`. 2) Each `yield` writes bytes
+immediately. 3) We send `meta` first (conversation id), then one `token` frame
+per fragment, then exactly one `done` or `error`. 4) Every payload is
+JSON-encoded. 5) Response headers disable caching and proxy buffering.
+**Math** — none, but two numbers matter and are worth naming:
+**TTFT (time-to-first-token)** = time from request received to the first token
+leaving. **p95 latency** = the value 95% of requests come in under; the
+1-in-20 worst case, which is what users complain about. An average hides it.
+**Why this / why not alternatives** — vs **WebSockets**: full duplex, so both
+sides can send. That is genuinely needed for collaborative editing or voice; our
+traffic is one-directional, and WebSockets add an upgrade handshake that some
+corporate proxies and CDNs mangle, plus reconnection logic you write yourself.
+vs **long polling**: works everywhere, but each answer is one held request that
+must be re-issued, and you get no partial output — it solves timeouts, not
+perceived latency. vs **chunked JSON / NDJSON**: perfectly workable and what
+some LLM APIs do, but `EventSource` gives named events, automatic reconnect and
+`Last-Event-ID` for free, and named events are what let one stream carry `meta`,
+`token`, `done` and `error` without inventing a discriminator field.
+**Internal working** — The connection stays open with `Transfer-Encoding:
+chunked`. Each `yield` is flushed down the socket. `EventSource` parses on the
+blank-line delimiter and dispatches by event name; if the connection drops it
+reconnects automatically and replays `Last-Event-ID` if the server set ids.
+**Common bugs** —
+- *Raw text in `data:`.* An answer fragment containing `\n\n` ends the frame
+  early and splits one token into two events. Fix: JSON-encode every payload —
+  this is why `_sse` calls `json.dumps`.
+- *nginx buffering.* The default proxy config buffers the whole response, so
+  the endpoint streams perfectly in dev and behaves like a slow non-streaming
+  endpoint in production. Fix: `X-Accel-Buffering: no`.
+- *Missing `Cache-Control: no-cache`.* A shared proxy can serve one user's
+  answer to another.
+- *Errors after the first byte.* The status code is spent — a 200 is already on
+  the wire. Anything that deserves a 429 or 503 must be decided **before**
+  streaming starts; later failures can only be an `error` frame.
+- *Holding a DB connection across the stream.* Generation takes seconds; twenty
+  concurrent users exhaust the pool. Commit and close before streaming.
+- *Blocking calls in an async handler.* SQLAlchemy is blocking; on the event
+  loop it stalls every other request. Wrap in `run_in_threadpool`.
+- *Client disconnect.* Raises `asyncio.CancelledError` inside the generator.
+  Decide deliberately whether that refunds the work (we do not — the tokens were
+  generated, and refunding would make disconnecting a way to get free answers).
+**Interview questions** —
+1. SSE vs WebSockets vs long polling — when is each right?
+2. Why is every SSE payload JSON here rather than raw text?
+3. Once you've sent a 200, how do you report an error mid-stream?
+4. What is TTFT and why report it separately from total latency?
+5. Why does `X-Accel-Buffering: no` exist and what breaks without it?
+6. How would you resume a stream that dropped halfway?
+7. Why must a streaming handler not hold a database connection?
+**Mini exercise** — With the API running, `curl -N -H "X-Bot-Key: <key>" -d
+'{"question":"..."}' -H 'Content-Type: application/json'
+localhost:8000/widget/chat` and watch the frames arrive. Then re-run without
+`-N` (curl buffers) and note that the output appears all at once — the same
+lesson nginx teaches in production.
+**5 takeaways** — (1) SSE is plain HTTP, one-directional, and enough.
+(2) The blank line is the frame delimiter — never let payload text contain one.
+(3) The status code is spent at the first byte. (4) Buffering proxies silently
+un-stream your stream. (5) TTFT is the number users feel.
+
+---
+
+### Rate limiting & metering (token bucket)            [Phase 3]
+**What it is** — Two different jobs that get confused. **Rate limiting** caps
+requests *per unit time* to protect the service (short horizon, seconds).
+**Metering** counts consumption *per billing period* to enforce a plan (long
+horizon, a month). We do both: a token bucket in Redis, and a
+`usage_records(org_id, period)` counter in Postgres.
+**Problem it solves** — Without the limiter, one script on a customer's page
+spends their whole monthly quota in seconds and our LLM budget with it. Without
+the meter, the "100 messages on free" in PLAN §6 is marketing copy, not a rule.
+**Intuition** — Rate limit = a bucket refilling at a steady drip; each request
+takes a cup, and an empty bucket means wait. Metering = a cloakroom ticket taken
+*before* you hand over the coat, and handed straight back if the cloakroom turns
+out to be full.
+**How it works (bucket)** — 1) Each identity has `(tokens, last_seen)`.
+2) On a request, refill lazily by elapsed time. 3) If `tokens ≥ 1`, spend one and
+allow. 4) Otherwise refuse with a `retry_after`. 5) All of it runs as one Lua
+script inside Redis so it is atomic.
+**How it works (meter)** — 1) `UPDATE … SET messages_used = messages_used + 1 …
+RETURNING messages_used`. 2) No row? `INSERT … RETURNING` inside a savepoint;
+on unique-violation, retry the UPDATE. 3) Compare to the plan cap. 4) Over →
+decrement back and raise. 5) Generation fails → `release_message` refunds one.
+**Math** —
+```
+elapsed = now − last_seen
+tokens  = min(capacity, tokens + elapsed × rate)      # lazy refill
+allowed = tokens ≥ 1                                   # then tokens −= 1
+```
+`capacity` = burst (10), `rate` = per_minute/60 tokens per second. Refill is
+computed on read, so an idle bucket costs nothing to keep and is correct the
+moment it is touched again. Metering has no formula beyond `used + 1` — the
+whole difficulty is making that one atomic statement instead of two.
+**Complexity** — bucket: O(1) time, O(1) state per identity (two numbers).
+Compare a sliding-window *log*, which is O(requests) space per identity.
+**Why this / why not alternatives** — vs **fixed window** ("100/min, reset on the
+minute"): trivial, and allows 200 requests across a window boundary — the classic
+burst-at-midnight bug. vs **sliding window log**: exact, but stores a timestamp
+per request; fine at small scale, expensive at ours. vs **leaky bucket**:
+smooths output to a constant rate, which is right for a queue drain and wrong
+here — it forbids the burst real users legitimately produce. vs **counting
+messages with `COUNT(*)` at request time** instead of a counter row: one source
+of truth, no drift, and it gets slower every month on the hot path of every
+message. vs **counting after success instead of reserving first**: simpler, and
+it makes the cap advisory — 500 concurrent requests all pass the check and all
+get answered.
+**Internal working** — Redis is single-threaded and executes a Lua script
+atomically, so refill-and-spend cannot interleave. Our client sets a 250ms
+connect/read timeout, no retries, and a 30-second circuit breaker: after a
+failure it stops attempting Redis at all for 30s and uses an in-process
+`OrderedDict` LRU bucket. That fallback **fails open** — a Redis outage must not
+take chat down.
+**Common bugs** —
+- *`burst or default`.* An explicitly configured `0` is falsy and is silently
+  replaced by the default. Real bug, hit in this codebase. Fix: `is not None`.
+- *Capacity 0.* A bucket that can never hold one token 429s everything — a config
+  typo presenting as a total outage. Floor both values at 1.
+- *Read-modify-write on the counter.* Two requests read 47, both write 48; one
+  message served free. This is the **lost update** problem. Fix: `UPDATE …
+  RETURNING`, one statement.
+- *Default redis-py retry policy.* Exponential backoff on connection errors made
+  the test suite take 43s and would add seconds to every chat request during an
+  outage. Fix: tight timeouts, `Retry(NoBackoff(), 0)`, circuit breaker.
+- *`IntegrityError` without a savepoint.* A failed speculative INSERT poisons the
+  transaction, so the retry fails with "current transaction is aborted". Wrap in
+  `db.begin_nested()`.
+- *Rate-limiting on the raw credential.* Keys end up in Redis, logs and metrics
+  labels. Bucket on a hash of it.
+- *Refunding on client disconnect.* Lets a client get free answers by hanging up
+  just before the last token.
+**Interview questions** —
+1. Token bucket vs fixed window vs sliding window — trade-offs?
+2. Should a rate limiter fail open or fail closed? What decides?
+3. Why is the increment `UPDATE … RETURNING` rather than SELECT-then-UPDATE?
+4. Why reserve quota before doing the work instead of counting after?
+5. Why must the bucket logic be a Lua script rather than GET then SET?
+6. What is a circuit breaker and what problem did it solve here?
+7. Why is `period` a `"YYYY-MM"` string in UTC rather than a DATE?
+8. Two sources of truth (counter + messages table) — how do you keep them honest?
+**Mini exercise** — By hand: capacity 10, rate 20/min (= 1 token per 3s). The
+bucket is empty at t=0. A request arrives at t=15s, another at t=16s, another at
+t=17s. Which are allowed, and what is `tokens` after each?
+**5 takeaways** — (1) Rate limiting protects the service; metering enforces the
+plan. Different horizons, different storage. (2) The bucket is two numbers and a
+timestamp — refill lazily. (3) Atomic or it's a race: Lua in Redis, `RETURNING`
+in SQL. (4) Reserve before the work, refund on failure. (5) Fail open when you
+are protecting cost, closed when you are protecting security.
+
+---
+
+### Idempotency (safe retries)            [Phase 3]
+**What it is** — An operation is **idempotent** when doing it twice has the same
+effect as doing it once. Over an unreliable network the client cannot tell
+"never arrived" from "arrived, reply lost", so it must be safe to retry. The
+usual mechanism is an **idempotency key**: a client-generated id sent with the
+request, which the server records and uses to recognise a repeat.
+**Problem it solves** — A widget on a phone loses signal mid-answer. It retries.
+Without a key that is a second LLM call, a second charge against the monthly
+quota, and a duplicate pair of rows in the transcript — for one question the user
+asked once.
+**Intuition** — A cheque number. Present the same cheque twice and the bank pays
+once; the number is what lets it tell a re-presentation from a second payment.
+**How it works** — 1) Client sends `client_message_id` (a UUID it generates and
+keeps for the life of that question). 2) `UNIQUE (conversation_id,
+client_message_id)` on `messages`. 3) Before reserving quota, the endpoint looks
+for an assistant row with that key. 4) Found → replay the stored answer: no LLM
+call, no metering, no new rows. 5) Not found → generate, and store the key on the
+assistant row. 6) If two retries race and both generate, the constraint rejects
+the second and the first answer stands.
+**Why this / why not alternatives** — vs **hashing the request body**: needs no
+client cooperation, and it cannot distinguish "retry" from "the user genuinely
+asked the same question again" — a real and common case in chat. vs **a separate
+`idempotency_keys` table** (Stripe's shape): more general, stores the whole
+response, and is the right answer when many endpoints need it; here exactly one
+artifact is being deduplicated (the answer), so the key lives on that row.
+vs **a Redis SETNX lock**: fast, and it expires — a retry after the TTL
+regenerates and re-bills. The database constraint is permanent. vs **doing
+nothing and letting retries duplicate**: acceptable for a read, not for anything
+that costs money.
+**Internal working** — The unique constraint is doing the real work, and it is
+scoped to the conversation rather than being global because the value comes from
+a browser and only has to be unique where it is compared. Postgres does not treat
+two NULLs as equal in a unique index, so the many messages that omit a key (the
+dashboard playground has no reconnect logic) coexist happily under the same
+constraint.
+**Where else this project relies on it** — Celery's `acks_late` means a task
+killed mid-run is redelivered, so ingestion must tolerate running twice; it does,
+because point ids in Qdrant are deterministic and a re-run overwrites its own
+partial work. Same concept, different mechanism: **natural** idempotency from
+deterministic ids, versus **enforced** idempotency from a key plus a constraint.
+Alembic migrations are a third flavour — `alembic upgrade head` is idempotent
+because the version table records what has already run.
+**Common bugs** —
+- *Key stored on the wrong row.* Ours is on the **assistant** row, because the
+  answer is the artifact being deduplicated. On the user row, a retry would find
+  the question and have no answer to replay.
+- *Global uniqueness.* Browser-generated ids collide across users eventually;
+  scoping to the conversation removes the problem entirely.
+- *Checking after the expensive work.* The check must come before reserving quota
+  and before calling the model, or the retry costs exactly what it was meant to
+  save.
+- *Assuming a key means a duplicate.* The same key in a *different* conversation
+  is a different message. Tested explicitly.
+- *Forgetting the race.* Two retries can arrive simultaneously and both miss the
+  lookup. The constraint is the backstop; the `IntegrityError` branch keeps the
+  first answer.
+- *Retrying a non-idempotent endpoint.* If `POST` creates a row with no key, an
+  automatic client retry silently duplicates data. This is why HTTP defines PUT
+  and DELETE as idempotent and POST as not.
+**Interview questions** —
+1. Define idempotency. Which HTTP methods are idempotent, and why does it matter?
+2. How would you make a payment endpoint safe to retry?
+3. Idempotency key vs request hashing — when does each fail?
+4. Why is the key scoped to a conversation rather than globally unique?
+5. Two retries race past the lookup. What stops the double charge?
+6. What is the difference between idempotent and "at-most-once delivery"?
+7. Why does `acks_late` in Celery *require* idempotent tasks?
+**Mini exercise** — Draw the timeline for: request sent → server answers →
+response lost → client retries. Mark where the quota is spent, where the rows are
+written, and what the second request reads. Then do it again with the two
+requests overlapping.
+**5 takeaways** — (1) The network cannot tell you whether your request arrived —
+design for the retry. (2) A key plus a unique constraint is the cheapest correct
+mechanism. (3) Check before you spend money, not after. (4) Deterministic ids
+give idempotency for free; use them where you can. (5) Scope the key where it is
+compared, and let NULLs opt out.

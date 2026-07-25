@@ -1,10 +1,10 @@
-"""ORM tables for Phase 2: organizations, users, chatbots, documents.
+"""ORM tables: organizations, users, chatbots, documents (Phase 2) and
+conversations, messages, usage_records (Phase 3).
 
-PLAN §4's data model, restricted to what Phase 2 actually needs. Conversations,
-messages, usage_records and subscriptions are deliberately absent — they belong
-to Phase 3 (chat + metering) and Phase 6 (billing), and a table with no writer
-is a schema guess that hardens into a migration before anyone learns whether it
-was right.
+PLAN §4's data model, restricted to what has a writer. `subscriptions` is still
+deliberately absent — it belongs to Phase 6 (billing), and a table nothing
+writes to is a schema guess that hardens into a migration before anyone learns
+whether it was right.
 
 **The organizing principle: `org_id` is on every tenant-scoped row.**
 
@@ -46,6 +46,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -73,6 +74,14 @@ PUBLIC_KEY_PREFIX = "pk_"
 # 32 bytes -> 43 url-safe characters. Well past the point where brute-forcing a
 # key is more expensive than attacking anything else in the system.
 PUBLIC_KEY_BYTES = 32
+
+# JSONB is a PostgreSQL type and does not compile on any other dialect.
+# `with_variant` hands SQLite the generic JSON type instead, which is what lets
+# `tests/test_limits.py` build this entire schema in memory with no Docker —
+# the same trade Phase 2 made when `VectorStore` gained `location=":memory:"`
+# for the isolation test. On Postgres this is byte-for-byte JSONB, so the
+# emitted production DDL (and migration 0001) is unchanged.
+JSON_COLUMN = JSONB().with_variant(JSON(), "sqlite")
 
 
 def generate_public_key() -> str:
@@ -152,6 +161,33 @@ class SourceType(enum.StrEnum):
 
     FILE = "file"
     URL = "url"
+
+
+class Channel(enum.StrEnum):
+    """Where a conversation came from.
+
+    Worth storing because the two have different economics and different
+    trust: PLAYGROUND is the owner testing their own bot from the dashboard,
+    WIDGET is an anonymous member of the public on someone else's website.
+    Phase 6 will want to know whether a plan's message quota was spent on
+    customers or on testing, and that question is unanswerable retroactively.
+    """
+
+    WIDGET = "widget"
+    PLAYGROUND = "playground"
+
+
+class MessageRole(enum.StrEnum):
+    """Who produced a message.
+
+    Only two values, matching what is actually persisted. The system prompt is
+    not stored per message: it is rebuilt from the chatbot row and the retrieved
+    context on every request, so a copy here would be a stale duplicate of two
+    things that already exist.
+    """
+
+    USER = "user"
+    ASSISTANT = "assistant"
 
 
 # Plan limits, seeded from PLAN §4. In code rather than in a `plans` table
@@ -323,7 +359,7 @@ class Chatbot(Base):
     # premium client running Claude while everyone else runs Gemini, without a
     # migration per knob. Renamed from PLAN's `model_config`; see module docs.
     model_overrides: Mapped[dict] = mapped_column(
-        JSONB, nullable=False, default=dict, server_default="{}"
+        JSON_COLUMN, nullable=False, default=dict, server_default="{}"
     )
 
     embedding_model: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -347,6 +383,9 @@ class Chatbot(Base):
 
     organization: Mapped[Organization] = relationship(back_populates="chatbots")
     documents: Mapped[list["Document"]] = relationship(
+        back_populates="chatbot", cascade="all, delete-orphan"
+    )
+    conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="chatbot", cascade="all, delete-orphan"
     )
 
@@ -437,3 +476,203 @@ class Document(Base):
     )
 
     chatbot: Mapped[Chatbot] = relationship(back_populates="documents")
+
+
+# --------------------------------------------------------------------------
+# Phase 3: chat transcripts and metering
+# --------------------------------------------------------------------------
+
+
+class Conversation(Base):
+    """One continuous chat session with one bot.
+
+    Created on the first message and reused for every follow-up, which is what
+    makes multi-turn possible: the id is what the client sends back to say "same
+    conversation". Anonymous by design — there is no user column, because widget
+    traffic is the public on a customer's website and we neither have nor want
+    their identity.
+
+    Carries `org_id` for the same reason `documents` does: every tenant-scoped
+    query then filters a column that is physically on the row, with no join to
+    forget.
+    """
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        # The dashboard's conversations tab: this bot's threads, most recently
+        # active first. `last_message_at` leads over `started_at` because a
+        # thread that is still alive matters more than one that started earlier.
+        Index("ix_conversations_scope", "org_id", "chatbot_id", "last_message_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chatbot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chatbots.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel: Mapped[Channel] = mapped_column(
+        SAEnum(Channel, name="conversation_channel"),
+        nullable=False,
+        default=Channel.WIDGET,
+        server_default=Channel.WIDGET.value,
+    )
+
+    started_at: Mapped[datetime] = _created_at()
+
+    # Denormalized, and deliberately so. The conversations list sorts by "last
+    # active", and deriving that from `max(messages.created_at)` costs either a
+    # correlated subquery per row or a join+group-by over the largest table in
+    # the schema — on every page load. One column written inside the same
+    # transaction that writes the message keeps it exact.
+    last_message_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    chatbot: Mapped[Chatbot] = relationship(back_populates="conversations")
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        # Transcripts are read in the order they happened; without this the ORM
+        # returns whatever order the database felt like.
+        order_by="Message.created_at",
+    )
+
+
+class Message(Base):
+    """One turn: a question from a user or a grounded answer from the bot.
+
+    The assistant rows are where Phase 3's observability lives — `citations`,
+    `tokens_*` and `latency_ms` are the raw material for PLAN §7's metrics
+    section, and none of them can be reconstructed after the fact.
+
+    **Token counts are estimates, and the column names do not lie about it: see
+    `core/chat.py`.** `LLMProvider.stream()` yields text and nothing else, so
+    there is no vendor usage number to record without changing a Phase 1
+    contract that four providers already implement. Plan caps are counted in
+    messages, not tokens, so nothing billable depends on these — they are for
+    spotting a prompt that has quietly doubled in size.
+    """
+
+    __tablename__ = "messages"
+    __table_args__ = (
+        # Transcript read: one conversation, in order.
+        Index("ix_messages_conversation", "conversation_id", "created_at"),
+        # Usage reconciliation: "how many messages did this org send this
+        # month" must not scan every tenant's traffic.
+        Index("ix_messages_org_created", "org_id", "created_at"),
+        # The idempotency guarantee. A widget whose connection dropped mid-answer
+        # retries with the SAME client_message_id; this constraint is what makes
+        # the retry return the stored answer instead of generating (and
+        # metering) a second one. Scoped to the conversation rather than global
+        # because the id comes from a browser and only has to be unique where it
+        # is actually compared.
+        UniqueConstraint(
+            "conversation_id", "client_message_id", name="uq_message_client_id"
+        ),
+        CheckConstraint(
+            "tokens_in >= 0 AND tokens_out >= 0 AND latency_ms >= 0",
+            name="ck_message_counters_non_negative",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[MessageRole] = mapped_column(
+        SAEnum(MessageRole, name="message_role"), nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # NULL on user messages, a list of citation objects on assistant messages.
+    # Stored as JSON rather than a join table because it is written once, read
+    # whole, and never queried by its contents — a `citations` table would be
+    # three joins to render one chat bubble.
+    citations: Mapped[list | None] = mapped_column(JSON_COLUMN, nullable=True)
+
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Wall-clock time from request received to stream finished. The number that
+    # tells you whether the product feels fast; PLAN §7 reports p50/p95 of it.
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Client-supplied idempotency key. Nullable because the dashboard playground
+    # has no reconnect logic and does not need one; NULLs do not collide in a
+    # unique index, so many messages may omit it.
+    client_message_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+    created_at: Mapped[datetime] = _created_at()
+
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class UsageRecord(Base):
+    """One organization's consumption in one calendar month.
+
+    A counter, not a log. The messages table already holds the log; this row
+    exists so that "are you over your plan?" is a single indexed lookup on the
+    hot path of every chat request rather than a COUNT over a table that grows
+    forever.
+
+    The pair (org_id, period) is unique, and that constraint is load-bearing
+    rather than tidy: `core/metering.py` relies on it to turn increment-or-create
+    into one atomic statement. Without it, two simultaneous first-messages of the
+    month create two rows and every subsequent count is wrong.
+    """
+
+    __tablename__ = "usage_records"
+    __table_args__ = (
+        UniqueConstraint("org_id", "period", name="uq_usage_org_period"),
+        CheckConstraint(
+            "messages_used >= 0 AND docs_ingested >= 0",
+            name="ck_usage_counters_non_negative",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # "YYYY-MM", UTC. A string rather than a date because it is an identifier
+    # for a billing window, not a point in time — and because a DATE column
+    # invites someone to store the 3rd of the month and break the uniqueness
+    # that the whole design rests on. UTC rather than the org's local timezone:
+    # a tenant that moves country would otherwise get two partial months.
+    period: Mapped[str] = mapped_column(String(7), nullable=False, index=True)
+
+    messages_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    docs_ingested: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

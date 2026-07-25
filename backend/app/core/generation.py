@@ -131,6 +131,7 @@ async def stream_answer(
     *,
     llm: LLMProvider | None = None,
     history: list[Message] | None = None,
+    persona: str | None = None,
     max_tokens: int = DEFAULT_MAX_ANSWER_TOKENS,
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
 ) -> AsyncIterator[str]:
@@ -141,10 +142,15 @@ async def stream_answer(
     four-second answer that starts in 400ms feels responsive, and the same
     answer delivered whole at four seconds feels broken.
 
-    `history` is accepted but not yet used for retrieval — Phase 3 adds query
-    rewriting so that a follow-up like "what about refunds?" is expanded with
-    the earlier turns before it is embedded. Passing it through now keeps the
-    signature stable.
+    `history` is the earlier turns of this conversation, replayed to the model so
+    a follow-up like "and what about refunds?" is understood. It is used for
+    GENERATION only; deciding what to retrieve from a follow-up is
+    `core/chat.py`'s job, because that decision needs the question rewritten
+    before it is embedded and this function never sees the embedder.
+
+    `persona` is the chatbot's own system prompt, inserted into the template's
+    STYLE block rather than concatenated here — see `prompts.render_grounded_answer`
+    on why position matters.
     """
     if not question.strip():
         raise ValueError("question must not be empty")
@@ -162,7 +168,7 @@ async def stream_answer(
         yield REFUSAL
         return
 
-    system = render_grounded_answer(context.text)
+    system = render_grounded_answer(context.text, persona=persona)
     messages = [*(history or []), Message(role="user", content=question)]
 
     logger.info(
@@ -172,6 +178,7 @@ async def stream_answer(
             "chunks_used": len(context.used),
             "chunks_dropped": context.dropped,
             "citations": context.citations,
+            "history_messages": len(history or []),
         },
     )
 

@@ -24,7 +24,15 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.db.tables import ChatbotStatus, DocumentStatus, PlanTier, SourceType
+from app.core.chat import MAX_QUESTION_CHARS
+from app.db.tables import (
+    Channel,
+    ChatbotStatus,
+    DocumentStatus,
+    MessageRole,
+    PlanTier,
+    SourceType,
+)
 
 # Applied to every INBOUND model. `extra="forbid"` turns an unexpected field
 # into a 422 instead of a shrug; see the module docstring on why silence is the
@@ -138,6 +146,105 @@ class DocumentOut(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Chat (Phase 3)
+# --------------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    """Body for both chat endpoints.
+
+    Read the absent fields first, because they are the security design:
+
+    - **no `chatbot_id`**. The widget route derives it from the bot key and the
+      dashboard route from the URL path, both server-side. A body field would
+      let anyone holding one public key chat with every bot in the system.
+    - **no `org_id`**, for the reason stated at the top of this module.
+    - **no `system_prompt`, `model`, `top_k` or `max_tokens`**. Every one of
+      those is a knob that costs money or changes behaviour, and a caller who
+      can set them from a `<script>` tag on someone else's website is a caller
+      who can run our LLM budget at their chosen size. They live on the chatbot
+      row, editable only by an authenticated owner.
+
+    `conversation_id` IS accepted, and it is the one field that could be forged
+    — so the handler verifies it belongs to the same (org, chatbot) before using
+    it, and creates a new conversation if it does not. See `api/chat.py`.
+    """
+
+    model_config = _STRICT_IN
+
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+
+    # Continue an existing thread. Absent means "start a new one" — which is the
+    # normal first message from a widget that has just loaded.
+    conversation_id: uuid.UUID | None = None
+
+    # Idempotency key, supplied by the client (see `messages.client_message_id`).
+    # A widget whose connection dropped mid-answer retries with the same value
+    # and receives the stored answer instead of paying for a second generation.
+    # Free-form because it comes from a browser: a UUID in practice, but nothing
+    # depends on its shape, only on its stability.
+    client_message_id: str | None = Field(default=None, max_length=80)
+
+
+class CitationOut(BaseModel):
+    """One source under an answer.
+
+    Mirrors `core.chat.Citation` rather than reusing it: that is a domain type
+    free to change, this is a wire format that clients depend on.
+    """
+
+    citation: str
+    document_id: str
+    source: str
+    page_start: int | None = None
+    page_end: int | None = None
+    score: float | None = None
+
+
+class MessageOut(BaseModel):
+    """One stored turn, as the dashboard's conversation viewer sees it.
+
+    Includes the observability columns because the viewer is where you go to ask
+    "why was this answer bad?" — and the answer is usually visible in the
+    citations (retrieval missed) or the latency (a provider was struggling).
+    """
+
+    model_config = _FROM_ORM
+
+    id: uuid.UUID
+    role: MessageRole
+    content: str
+    citations: list[CitationOut] | None
+    tokens_in: int | None
+    tokens_out: int | None
+    latency_ms: int | None
+    created_at: datetime
+
+
+class ConversationOut(BaseModel):
+    """A thread, without its messages.
+
+    Deliberately not nested: the list view renders hundreds of these and needs
+    none of the message bodies, and loading them would be the classic list-page
+    N+1. One extra request fetches a transcript when a row is actually opened.
+    """
+
+    model_config = _FROM_ORM
+
+    id: uuid.UUID
+    chatbot_id: uuid.UUID
+    channel: Channel
+    started_at: datetime
+    last_message_at: datetime
+
+
+class ConversationDetailOut(ConversationOut):
+    """One thread with its full transcript, in order."""
+
+    messages: list[MessageOut]
+
+
+# --------------------------------------------------------------------------
 # Organization / usage
 # --------------------------------------------------------------------------
 
@@ -159,8 +266,12 @@ class UsageOut(BaseModel):
 
     Returned on the 429 when a limit is hit as well as from the usage endpoint,
     so a client that gets refused has the numbers to explain why without a
-    second round trip. Message metering arrives in Phase 3; the counts that
-    exist in Phase 2 are the ones this phase can honestly report.
+    second round trip.
+
+    Three different shapes of limit live here, and the difference matters when
+    reading the dashboard: chatbots and documents are STOCKS (delete one, free a
+    slot), while messages are a monthly FLOW that resets — which is why only the
+    message counters carry a `period`.
     """
 
     plan: PlanTier
@@ -168,3 +279,8 @@ class UsageOut(BaseModel):
     chatbots_limit: int
     documents_used: int
     documents_limit: int
+
+    # Phase 3. "YYYY-MM" in UTC; see `core/metering.current_period`.
+    period: str
+    messages_used: int
+    messages_limit: int

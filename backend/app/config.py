@@ -60,6 +60,38 @@ class Settings(BaseSettings):
     # so this only bounds how long a REVOKED key stays accepted.
     clerk_jwks_cache_seconds: int = 3600
 
+    # --- Chat (Phase 3) ---
+    # Where an LLM failure falls back to. `None` disables fallback entirely,
+    # which is the honest setting when only one provider is configured — a
+    # fallback that cannot authenticate turns one clean error into two.
+    # Deliberately a separate knob from `llm_provider`: pointing both at the
+    # same vendor would "fall back" onto the outage we are trying to escape.
+    llm_fallback_provider: (
+        Literal["gemini", "groq", "ollama", "anthropic", "openai"] | None
+    ) = "groq"
+
+    # How many earlier messages of a conversation are replayed to the model.
+    # Counted in messages, not turns: 6 is three question/answer pairs. Bounded
+    # because history is resent on EVERY request, so an unbounded transcript
+    # grows the prompt (and the latency, and the cost) without limit.
+    chat_history_messages: int = 6
+
+    # Per-widget-key rate limit, as a token bucket (see security/rate_limit.py).
+    # `per_minute` is the sustained refill rate; `burst` is how many requests
+    # may arrive at once before throttling starts. Burst > 0 matters because
+    # real users send a question, read, then send another — a strict
+    # one-per-3-seconds limiter punishes that pattern for no benefit.
+    chat_rate_limit_per_minute: int = 20
+    chat_rate_limit_burst: int = 10
+
+    # Browser origins allowed to call the API. Default "*" because the widget
+    # is embedded on customers' own domains, which we do not know in advance.
+    # Safe here only because authentication is a HEADER (bot key or bearer
+    # token), never a cookie: a hostile page cannot make the browser attach a
+    # credential it does not already have. If cookie auth is ever introduced,
+    # this must become an explicit list on the same day.
+    cors_origins: list[str] = ["*"]
+
     # --- Uploads (Phase 2) ---
     # Local disk in dev; Phase 7 swaps this for object storage on the Oracle
     # box. Kept as a setting rather than a constant so the worker and the API,

@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.extraction import ExtractionError
 from app.core.ingestion import IngestionResult, ingest_file
+from app.core.metering import record_document_ingested
 from app.core.vectorstore import VectorStore, VectorStoreError
 from app.db.base import SessionLocal
 from app.db.tables import Chatbot, ChatbotStatus, Document, DocumentStatus
@@ -196,6 +197,14 @@ def ingest_document(self, document_id: str) -> dict:
             chatbot.status = ChatbotStatus.READY
 
         session.commit()
+
+        # Monthly counter, committed separately and deliberately AFTER the
+        # document is READY. It is a statistic, not a gate — nothing is refused
+        # on it — so a failure here must not roll back an ingestion that
+        # genuinely succeeded. `record_document_ingested` swallows its own
+        # errors for the same reason.
+        record_document_ingested(session, document.org_id)
+
         logger.info("ingestion succeeded", extra={**log, "chunks": result.chunks})
         return {"status": "ready", "chunks": result.chunks, **log}
     finally:
